@@ -1,0 +1,224 @@
+# Service Account for RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-server-sa
+  namespace: spire
+---
+
+# ClusterRole and Role
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spire-server-cluster-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods","nodes"]
+    verbs: ["get"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spire-server-cluster-role-binding
+subjects:
+  - kind: ServiceAccount
+    name: spire-server-sa
+    namespace: spire
+roleRef:
+  kind: ClusterRole
+  name: spire-server-cluster-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spire-server-role
+  namespace: spire
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["patch", "get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spire-server-role-binding
+  namespace: spire
+subjects:
+  - kind: ServiceAccount
+    name: spire-server-sa
+    namespace: spire
+roleRef:
+  kind: Role
+  name: spire-server-role
+  apiGroup: rbac.authorization.k8s.io
+---
+
+#Configmap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-server-configmap
+  namespace: spire
+data:
+  server.conf: |
+    server {
+      bind_address = "0.0.0.0"
+      bind_port = "8081"
+      socket_path = "/tmp/spire-server/private/api.sock"
+      trust_domain = "ndip"
+      data_dir = "/run/spire/data"
+      log_level = "DEBUG"
+      ca_key_type = "ec-p384"
+      ca_subject = {
+        country = ["VN"],
+        organization = ["GEIC"],
+        common_name = "",
+      }
+    }
+
+    plugins {
+      DataStore "sql" {
+        plugin_data {
+          database_type = "sqlite3"
+          connection_string = "/run/spire/data/datastore.sqlite3"
+        }
+      }
+
+      NodeAttestor "k8s_psat" {
+        plugin_data {
+          clusters = {
+            "geic-cluster" = {
+              service_account_allow_list = ["spire:spire-agent-sa"]
+            }
+          }
+        }
+      }
+
+      KeyManager "disk" {
+        plugin_data {
+          keys_path = "/run/spire/data/keys.json"
+        }
+      }
+
+      Notifier "k8sbundle" {
+        plugin_data {
+        }
+      }
+    }
+
+    health_checks {
+      listener_enabled = true
+      bind_address = "0.0.0.0"
+      bind_port = "8080"
+      live_path = "/live"
+      ready_path = "/ready"
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-bundle
+  namespace: spire
+---
+
+# StatefulSet Resource for Server
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spire-server
+  namespace: spire
+  labels:
+    app: spire-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spire-server
+  serviceName: spire-server-service
+  template:
+    metadata:
+      namespace: spire
+      labels:
+        app: spire-server
+    spec:
+      serviceAccountName: spire-server-sa
+      hostPID: false
+      hostNetwork: false
+      securityContext:
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: spire-server
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+          image: ghcr.io/spiffe/spire-server:1.15.2
+          args:
+            - -config
+            - /run/spire/config/server.conf
+          ports:
+            - containerPort: 8081
+          volumeMounts:
+            - name: spire-data
+              mountPath: /run/spire/data
+              readOnly: false
+            - name: spire-server-config
+              mountPath: /run/spire/config
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            failureThreshold: 3
+            initialDelaySeconds: 15
+            periodSeconds: 60
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: spire-server-config
+          configMap:
+            name: spire-server-configmap
+  volumeClaimTemplates:
+    - metadata:
+        name: spire-data
+        namespace: spire
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+          limits:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spire-server-service
+  namespace: spire
+spec:
+  type: NodePort
+  ports:
+    - name: grpc
+      port: 8081
+      targetPort: 8081
+      protocol: TCP
+  selector:
+    app: spire-server

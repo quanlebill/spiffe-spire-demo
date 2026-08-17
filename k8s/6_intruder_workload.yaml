@@ -1,0 +1,87 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: intruder-workload
+  namespace: workloads
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: intruder-workload
+  namespace: workloads
+  labels:
+    app: intruder-workload
+spec:
+  serviceAccountName: intruder-workload
+  restartPolicy: Never
+  securityContext:
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  initContainers:
+    - name: fetch-svid
+      image: ghcr.io/spiffe/spire-agent:1.15.2
+      command:
+        - /opt/spire/bin/spire-agent
+        - api
+        - fetch
+        - x509
+        - -socketPath
+        - /run/spire/sockets/agent.sock
+        - -write
+        - /run/spire/svids
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        allowPrivilegeEscalation: false
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: spire-agent-socket
+          mountPath: /run/spire/sockets
+          readOnly: true
+        - name: svid-files
+          mountPath: /run/spire/svids
+  containers:
+    - name: intruder-workload
+      image: frontend-workload:latest
+      imagePullPolicy: IfNotPresent
+      command:
+        - python
+        - -c
+        - |
+          import asyncio
+          from pathlib import Path
+          from shared.mutual_tls import load_client_ssl_context, open_mutual_tls_connection, send_json_request
+
+          async def main():
+              ssl_context = load_client_ssl_context(Path("/run/spire/svids/svid.0.pem"), Path("/run/spire/svids/svid.0.key"), Path("/run/spire/svids/bundle.0.pem"))
+              reader, writer, peer_spiffe_id = await open_mutual_tls_connection("backend-workload-service", 8443, ssl_context)
+              print(f"connected to peer {peer_spiffe_id}", flush=True)
+              status_code, response_json = await send_json_request(reader, writer, "backend-workload-service", "/receive-message", {"message": "hello from intruder"})
+              print(f"response status {status_code}: {response_json}", flush=True)
+
+          asyncio.run(main())
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        allowPrivilegeEscalation: false
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: svid-files
+          mountPath: /run/spire/svids
+          readOnly: true
+  volumes:
+    - name: spire-agent-socket
+      hostPath:
+        path: /run/spire/sockets
+        type: Directory
+    - name: svid-files
+      emptyDir: {}

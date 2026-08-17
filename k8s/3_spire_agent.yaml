@@ -1,0 +1,214 @@
+# Service Account for Spire Agent
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-agent-sa
+  namespace: spire
+---
+# RBAC for agent
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spire-agent-cluster-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "nodes/proxy"]
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spire-agent-cluster-role-binding
+subjects:
+  - kind: ServiceAccount
+    name: spire-agent-sa
+    namespace: spire
+roleRef:
+  kind: ClusterRole
+  name: spire-agent-cluster-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Configmap for agent
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-agent-configmap
+  namespace: spire
+data:
+  agent.conf: |
+    agent {
+      data_dir = "/run/spire/data"
+      log_level = "DEBUG"
+      server_address = "spire-server-service"
+      server_port = "8081"
+      socket_path = "/run/spire/sockets/agent.sock"
+      trust_bundle_path = "/run/spire/bundle/bundle.crt"
+      trust_domain = "ndip"
+    }
+
+    plugins {
+      NodeAttestor "k8s_psat" {
+        plugin_data {
+          cluster = "geic-cluster"
+        }
+      }
+
+      KeyManager "memory" {
+        plugin_data {
+        }
+      }
+
+      WorkloadAttestor "k8s" {
+        plugin_data {
+          skip_kubelet_verification = true
+          node_name_env = "MY_NODE_NAME"
+        }
+      }
+
+      WorkloadAttestor "unix" {
+          plugin_data {
+          }
+      }
+    }
+
+    health_checks {
+      listener_enabled = true
+      bind_address = "0.0.0.0"
+      bind_port = "8080"
+      live_path = "/live"
+      ready_path = "/ready"
+    }
+
+---
+
+# DaemonSet Resources for Agent
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: spire-agent
+  namespace: spire
+  labels:
+    app: spire-agent
+spec:
+  selector:
+    matchLabels:
+      app: spire-agent
+  template:
+    metadata:
+      namespace: spire
+      labels:
+        app: spire-agent
+    spec:
+      serviceAccountName: spire-agent-sa
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      securityContext:
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: spire-agent-init
+          image: cgr.dev/chainguard/wait-for-it
+          args:
+            - -t
+            - "60"
+            - spire-server-service:8081
+        - name: spire-agent-init-permissions
+          image: busybox:1.36
+          command: ["sh", "-c", "chown -R 1000:1000 /run/spire/sockets"]
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN"]
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+      containers:
+        - name: spire-agent
+          image: ghcr.io/spiffe/spire-agent:1.15.2
+          args:
+            - -config
+            - /run/spire/config/agent.conf
+          env:
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: MY_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: spire-agent-data
+              mountPath: /run/spire/data
+            - name: spire-agent-config
+              mountPath: /run/spire/config
+              readOnly: true
+            - name: spire-bundle
+              mountPath: /run/spire/bundle
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: false
+            - name: spire-token
+              mountPath: /var/run/secrets/tokens
+            - name: procfs
+              mountPath: /host/proc
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            failureThreshold: 2
+            initialDelaySeconds: 15
+            periodSeconds: 60
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: spire-agent-data
+          emptyDir:
+            medium: Memory
+        - name: spire-agent-config
+          configMap:
+            name: spire-agent-configmap
+        - name: procfs
+          hostPath:
+            path: /proc
+        - name: spire-bundle
+          configMap:
+            name: spire-bundle
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: spire-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: spire-agent
+                  expirationSeconds: 7200
+                  audience: spire-server
+
+
+
+
