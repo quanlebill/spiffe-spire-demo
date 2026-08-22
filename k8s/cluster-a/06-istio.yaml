@@ -1,0 +1,51 @@
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: geic-a-mesh
+  namespace: istio-system
+spec:
+  profile: minimal
+  meshConfig:
+    trustDomain: ndip
+    outboundTrafficPolicy:
+      mode: REGISTRY_ONLY
+    defaultConfig:
+      holdApplicationUntilProxyReady: true
+  components:
+    pilot:
+      k8s:
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 768Mi
+  values:
+    global:
+      proxy:
+        resources:
+          requests:
+            cpu: 50m
+            memory: 96Mi
+          limits:
+            memory: 384Mi
+    pilot:
+      env:
+        ENABLE_NATIVE_SIDECARS: "true"
+    sidecarInjectorWebhook:
+      templates:
+        spire: |
+          labels:
+            spiffe.io/spire-managed-identity: "true"
+          spec:
+            initContainers:
+            - name: istio-proxy
+              volumeMounts:
+              - name: workload-socket
+                mountPath: /run/secrets/workload-spiffe-uds
+                readOnly: true
+            volumes:
+              - name: workload-socket
+                csi:
+                  driver: "csi.spiffe.io"
+                  readOnly: true

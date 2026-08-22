@@ -1,52 +1,9 @@
 import asyncio
 import json
-import ssl
-import time
-
-from cryptography import x509
 
 
-def wait_for_svid_files(certificate_path, private_key_path, trust_bundle_path, timeout_seconds):
-    required_paths = [certificate_path, private_key_path, trust_bundle_path]
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if all(path.exists() for path in required_paths):
-            return
-        time.sleep(1)
-    missing_paths = [str(path) for path in required_paths if not path.exists()]
-    raise FileNotFoundError(f"svid files were not found before timeout: {missing_paths}")
-
-
-def load_server_ssl_context(certificate_path, private_key_path, trust_bundle_path):
-    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_context.load_cert_chain(certfile=str(certificate_path), keyfile=str(private_key_path))
-    ssl_context.load_verify_locations(cafile=str(trust_bundle_path))
-    ssl_context.verify_mode = ssl.CERT_REQUIRED
-    return ssl_context
-
-
-def load_client_ssl_context(certificate_path, private_key_path, trust_bundle_path):
-    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ssl_context.load_cert_chain(certfile=str(certificate_path), keyfile=str(private_key_path))
-    ssl_context.load_verify_locations(cafile=str(trust_bundle_path))
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_REQUIRED
-    return ssl_context
-
-
-def extract_spiffe_id_from_der_certificate(der_certificate_bytes):
-    certificate = x509.load_der_x509_certificate(der_certificate_bytes)
-    subject_alternative_names = certificate.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-    uniform_resource_identifiers = subject_alternative_names.value.get_values_for_type(x509.UniformResourceIdentifier)
-    return uniform_resource_identifiers[0] if uniform_resource_identifiers else None
-
-
-async def open_mutual_tls_connection(host, port, ssl_context):
-    reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
-    ssl_object = writer.get_extra_info("ssl_object")
-    peer_certificate_der = ssl_object.getpeercert(binary_form=True)
-    peer_spiffe_id = extract_spiffe_id_from_der_certificate(peer_certificate_der)
-    return reader, writer, peer_spiffe_id
+async def open_http_connection(host, port):
+    return await asyncio.open_connection(host, port)
 
 
 async def send_json_request(reader, writer, host, path, json_payload):
@@ -71,24 +28,28 @@ async def send_json_request(reader, writer, host, path, json_payload):
     response_body = await reader.read()
     writer.close()
     await writer.wait_closed()
-    return status_code, json.loads(response_body) if response_body else None
+    if not response_body:
+        return status_code, None
+    try:
+        return status_code, json.loads(response_body)
+    except json.JSONDecodeError:
+        return status_code, response_body.decode(errors="replace")
 
 
-async def run_mutual_tls_asgi_server(application, host, port, ssl_context):
+async def run_http_asgi_server(application, host, port):
     async def handle_client_connection(reader, writer):
         await dispatch_request_to_application(reader, writer, application)
 
-    server = await asyncio.start_server(handle_client_connection, host, port, ssl=ssl_context)
+    server = await asyncio.start_server(handle_client_connection, host, port)
     async with server:
         await server.serve_forever()
 
 
 async def dispatch_request_to_application(reader, writer, application):
-    ssl_object = writer.get_extra_info("ssl_object")
-    peer_certificate_der = ssl_object.getpeercert(binary_form=True)
-    peer_spiffe_id = extract_spiffe_id_from_der_certificate(peer_certificate_der)
-
     request_line = await reader.readline()
+    if not request_line:
+        writer.close()
+        return
     method, path, _ = request_line.decode().strip().split(" ")
 
     request_headers = []
@@ -106,20 +67,20 @@ async def dispatch_request_to_application(reader, writer, application):
 
     request_body = await reader.readexactly(content_length) if content_length else b""
 
+    raw_path, _, query_string = path.partition("?")
     request_scope = {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
         "http_version": "1.1",
-        "scheme": "https",
+        "scheme": "http",
         "method": method,
-        "path": path,
-        "raw_path": path.encode(),
+        "path": raw_path,
+        "raw_path": raw_path.encode(),
         "root_path": "",
-        "query_string": b"",
+        "query_string": query_string.encode(),
         "headers": request_headers,
         "client": writer.get_extra_info("peername"),
         "server": writer.get_extra_info("sockname"),
-        "workload_spiffe_id": peer_spiffe_id,
     }
 
     request_body_delivered = False

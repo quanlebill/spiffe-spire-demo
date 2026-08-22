@@ -1,0 +1,34 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: identity-plane-no-exec
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CONNECT"]
+        resources: ["pods/exec", "pods/attach", "pods/portforward"]
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["pods/ephemeralcontainers"]
+  variables:
+    - name: user
+      expression: request.userInfo.username
+  validations:
+    - expression: variables.user in ['system:serviceaccount:kube-system:spire-breakglass']
+      message: "denied: exec/attach/port-forward/ephemeral-containers are blocked in the identity plane. Registration entries must go through spire-controller-manager CRDs, not kubectl exec."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: identity-plane-no-exec
+spec:
+  policyName: identity-plane-no-exec
+  validationActions: ["Deny", "Audit"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        ndip.identity-plane: "true"

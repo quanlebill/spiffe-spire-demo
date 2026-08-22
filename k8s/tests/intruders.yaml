@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: intruder-plain
+  namespace: workloads
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: intruder-mesh
+  namespace: workloads
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: intruder-plain
+  namespace: workloads
+  labels:
+    app: intruder-plain
+  annotations:
+    sidecar.istio.io/inject: "false"
+spec:
+  serviceAccountName: intruder-plain
+  automountServiceAccountToken: false
+  containers:
+    - name: toolbox
+      image: zt-toolbox:latest
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "infinity"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: 20m
+          memory: 32Mi
+        limits:
+          memory: 192Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: intruder-mesh
+  namespace: workloads
+  labels:
+    app: intruder-mesh
+  annotations:
+    inject.istio.io/templates: "sidecar,spire"
+spec:
+  serviceAccountName: intruder-mesh
+  automountServiceAccountToken: false
+  containers:
+    - name: toolbox
+      image: zt-toolbox:latest
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "infinity"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: 20m
+          memory: 32Mi
+        limits:
+          memory: 192Mi

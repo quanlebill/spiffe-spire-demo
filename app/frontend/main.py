@@ -1,69 +1,67 @@
 import asyncio
-from pathlib import Path
+import os
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 
-from shared.mutual_tls import (
-    load_client_ssl_context,
-    load_server_ssl_context,
-    open_mutual_tls_connection,
-    run_mutual_tls_asgi_server,
-    send_json_request,
-    wait_for_svid_files,
-)
+from shared.http_transport import open_http_connection, run_http_asgi_server, send_json_request
+from shared.peer_identity import peer_spiffe_id_from_headers
 
-BACKEND_SPIFFE_ID = "spiffe://ndip/backend"
-BACKEND_HOST = "backend-workload-service"
-BACKEND_PORT = 8443
-LISTEN_HOST = "0.0.0.0"
-LISTEN_PORT = 8443
-SVID_CERTIFICATE_PATH = Path("/run/spire/svids/svid.0.pem")
-SVID_PRIVATE_KEY_PATH = Path("/run/spire/svids/svid.0.key")
-TRUST_BUNDLE_PATH = Path("/run/spire/svids/bundle.0.pem")
+SERVICE_NAME = os.environ.get("SERVICE_NAME", "frontend")
+CLUSTER_NAME = os.environ.get("CLUSTER_NAME", "unknown")
+SPIFFE_ID = os.environ.get("SPIFFE_ID", "unknown")
+BACKEND_HOST = os.environ.get("BACKEND_HOST", "backend")
+BACKEND_PORT = int(os.environ.get("BACKEND_PORT", "8080"))
+LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
+LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
 
 application = FastAPI()
 received_replies = []
 
 
-def require_backend_workload_identity(request: Request):
-    requester_spiffe_id = request.scope.get("workload_spiffe_id")
-    if requester_spiffe_id != BACKEND_SPIFFE_ID:
-        print(f"rejected request from unauthorized workload identity: {requester_spiffe_id}", flush=True)
-        raise HTTPException(status_code=403, detail="only the backend workload may call this endpoint")
+@application.get("/whoami")
+async def whoami():
+    return {"service": SERVICE_NAME, "cluster": CLUSTER_NAME, "spiffe_id": SPIFFE_ID, "listening_on": f"{LISTEN_HOST}:{LISTEN_PORT}"}
 
 
 @application.post("/receive-reply")
-async def receive_reply(request: Request, authorized=Depends(require_backend_workload_identity)):
+async def receive_reply(request: Request):
     request_payload = await request.json()
     reply_message = request_payload.get("reply", "")
-    print(f"received reply from {request.scope.get('workload_spiffe_id')}: {reply_message}", flush=True)
-    received_replies.append(reply_message)
+    caller_spiffe_id = peer_spiffe_id_from_headers(request)
+    print(f"received reply: {reply_message} from {caller_spiffe_id}", flush=True)
+    received_replies.append({"reply": reply_message, "caller": caller_spiffe_id})
     return {"status": "reply received"}
 
 
-async def send_message_to_backend(message_text):
-    client_ssl_context = load_client_ssl_context(SVID_CERTIFICATE_PATH, SVID_PRIVATE_KEY_PATH, TRUST_BUNDLE_PATH)
-    reader, writer, peer_spiffe_id = await open_mutual_tls_connection(BACKEND_HOST, BACKEND_PORT, client_ssl_context)
-    if peer_spiffe_id != BACKEND_SPIFFE_ID:
-        print(f"refusing to send message, unexpected peer identity: {peer_spiffe_id}", flush=True)
-        writer.close()
-        await writer.wait_closed()
-        return
-    await send_json_request(reader, writer, BACKEND_HOST, "/receive-message", {"message": message_text})
-    print(f"sent message to {peer_spiffe_id}: {message_text}", flush=True)
+@application.get("/replies")
+async def replies():
+    return {"service": SERVICE_NAME, "received": received_replies}
 
 
-async def send_initial_message_after_startup():
-    await asyncio.sleep(5)
-    await send_message_to_backend("hello from frontend")
+@application.get("/send")
+async def send(request: Request):
+    target_host = request.query_params.get("host", BACKEND_HOST)
+    target_port = int(request.query_params.get("port", BACKEND_PORT))
+    message_text = request.query_params.get("message", "hello from frontend")
+    return await send_message_to_backend(target_host, target_port, message_text)
+
+
+async def send_message_to_backend(target_host, target_port, message_text):
+    try:
+        reader, writer = await asyncio.wait_for(open_http_connection(target_host, target_port), timeout=10)
+        status_code, response_body = await asyncio.wait_for(
+            send_json_request(reader, writer, target_host, "/receive-message", {"message": message_text}), timeout=10
+        )
+        print(f"sent message to {target_host}:{target_port} -> {status_code} {response_body}", flush=True)
+        return {"target": f"{target_host}:{target_port}", "status_code": status_code, "body": response_body}
+    except Exception as error:
+        print(f"call to {target_host}:{target_port} failed: {type(error).__name__}: {error}", flush=True)
+        return {"target": f"{target_host}:{target_port}", "status_code": None, "error": f"{type(error).__name__}: {error}"}
 
 
 async def start_server():
-    wait_for_svid_files(SVID_CERTIFICATE_PATH, SVID_PRIVATE_KEY_PATH, TRUST_BUNDLE_PATH, timeout_seconds=30)
-    server_ssl_context = load_server_ssl_context(SVID_CERTIFICATE_PATH, SVID_PRIVATE_KEY_PATH, TRUST_BUNDLE_PATH)
-    print(f"frontend workload listening with mutual tls on {LISTEN_HOST}:{LISTEN_PORT}", flush=True)
-    asyncio.create_task(send_initial_message_after_startup())
-    await run_mutual_tls_asgi_server(application, LISTEN_HOST, LISTEN_PORT, server_ssl_context)
+    print(f"{SERVICE_NAME} ({SPIFFE_ID}) in {CLUSTER_NAME} listening on {LISTEN_HOST}:{LISTEN_PORT}, mtls handled by the envoy sidecar", flush=True)
+    await run_http_asgi_server(application, LISTEN_HOST, LISTEN_PORT)
 
 
 if __name__ == "__main__":

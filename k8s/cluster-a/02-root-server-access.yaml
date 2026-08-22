@@ -1,0 +1,75 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-root-reader
+  namespace: spire-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spire-root-reader
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spire-root-reader
+subjects:
+  - kind: ServiceAccount
+    name: spire-root-reader
+    namespace: spire-system
+roleRef:
+  kind: ClusterRole
+  name: spire-root-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spire-root-reader-pods
+  namespace: spire-system
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spire-root-reader-pods
+  namespace: spire-system
+subjects:
+  - kind: ServiceAccount
+    name: spire-root-reader
+    namespace: spire-system
+roleRef:
+  kind: Role
+  name: spire-root-reader-pods
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: spire-root-reader-token
+  namespace: spire-system
+  annotations:
+    kubernetes.io/service-account.name: spire-root-reader
+type: kubernetes.io/service-account-token
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spire-root-server
+  namespace: spire-system
+spec:
+  ports:
+    - name: grpc
+      port: 8081
+      protocol: TCP
+      targetPort: 30081

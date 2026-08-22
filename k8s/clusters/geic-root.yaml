@@ -1,0 +1,9 @@
+apiVersion: kind.x-k8s.io/v1alpha4
+kind: Cluster
+name: geic-root
+networking:
+  disableDefaultCNI: true
+  podSubnet: "10.30.0.0/16"
+  serviceSubnet: "10.130.0.0/16"
+nodes:
+  - role: control-plane

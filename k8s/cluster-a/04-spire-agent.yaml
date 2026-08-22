@@ -1,49 +1,68 @@
-# Service Account for Spire Agent
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: spire-agent-sa
-  namespace: spire
+  name: spire-agent
+  namespace: spire-system
 ---
-# RBAC for agent
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: spire-agent-cluster-role
+  name: spire-agent
 rules:
   - apiGroups: [""]
-    resources: ["pods", "nodes", "nodes/proxy"]
+    resources: ["nodes", "nodes/proxy"]
     verbs: ["get"]
-
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: spire-agent-cluster-role-binding
+  name: spire-agent
 subjects:
   - kind: ServiceAccount
-    name: spire-agent-sa
-    namespace: spire
+    name: spire-agent
+    namespace: spire-system
 roleRef:
   kind: ClusterRole
-  name: spire-agent-cluster-role
+  name: spire-agent
   apiGroup: rbac.authorization.k8s.io
-
 ---
-# Configmap for agent
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spire-agent-pod-reader
+  namespace: workloads
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spire-agent-pod-reader
+  namespace: workloads
+subjects:
+  - kind: ServiceAccount
+    name: spire-agent
+    namespace: spire-system
+roleRef:
+  kind: Role
+  name: spire-agent-pod-reader
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: spire-agent-configmap
-  namespace: spire
+  name: spire-agent
+  namespace: spire-system
 data:
   agent.conf: |
     agent {
-      data_dir = "/run/spire/data"
-      log_level = "DEBUG"
-      server_address = "spire-server-service"
+      data_dir = "/run/spire/agent-data"
+      log_level = "INFO"
+      server_address = "spire-nested-server.spire-system.svc.cluster.local"
       server_port = "8081"
-      socket_path = "/run/spire/sockets/agent.sock"
+      socket_path = "/run/spire/agent-sockets/socket"
       trust_bundle_path = "/run/spire/bundle/bundle.crt"
       trust_domain = "ndip"
     }
@@ -51,13 +70,12 @@ data:
     plugins {
       NodeAttestor "k8s_psat" {
         plugin_data {
-          cluster = "geic-cluster"
+          cluster = "geic-a"
         }
       }
 
       KeyManager "memory" {
-        plugin_data {
-        }
+        plugin_data {}
       }
 
       WorkloadAttestor "k8s" {
@@ -68,27 +86,23 @@ data:
       }
 
       WorkloadAttestor "unix" {
-          plugin_data {
-          }
+        plugin_data {}
       }
     }
 
     health_checks {
       listener_enabled = true
       bind_address = "0.0.0.0"
-      bind_port = "8080"
+      bind_port = "9980"
       live_path = "/live"
       ready_path = "/ready"
     }
-
 ---
-
-# DaemonSet Resources for Agent
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: spire-agent
-  namespace: spire
+  namespace: spire-system
   labels:
     app: spire-agent
 spec:
@@ -97,11 +111,10 @@ spec:
       app: spire-agent
   template:
     metadata:
-      namespace: spire
       labels:
         app: spire-agent
     spec:
-      serviceAccountName: spire-agent-sa
+      serviceAccountName: spire-agent
       hostPID: true
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
@@ -110,15 +123,9 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       initContainers:
-        - name: spire-agent-init
-          image: cgr.dev/chainguard/wait-for-it
-          args:
-            - -t
-            - "60"
-            - spire-server-service:8081
-        - name: spire-agent-init-permissions
+        - name: prepare-socket-dir
           image: busybox:1.36
-          command: ["sh", "-c", "chown -R 1000:1000 /run/spire/sockets"]
+          command: ["sh", "-c", "mkdir -p /run/spire/agent-sockets && chown 1000:1000 /run/spire/agent-sockets"]
           securityContext:
             runAsUser: 0
             runAsNonRoot: false
@@ -126,9 +133,16 @@ spec:
             capabilities:
               drop: ["ALL"]
               add: ["CHOWN"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
           volumeMounts:
             - name: spire-agent-socket
-              mountPath: /run/spire/sockets
+              mountPath: /run/spire/agent-sockets
       containers:
         - name: spire-agent
           image: ghcr.io/spiffe/spire-agent:1.15.2
@@ -140,10 +154,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            - name: MY_POD_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
           securityContext:
             runAsNonRoot: true
             runAsUser: 1000
@@ -152,63 +162,58 @@ spec:
             seccompProfile:
               type: RuntimeDefault
             capabilities:
-              drop:
-                - ALL
+              drop: ["ALL"]
           volumeMounts:
-            - name: spire-agent-data
-              mountPath: /run/spire/data
             - name: spire-agent-config
               mountPath: /run/spire/config
               readOnly: true
+            - name: spire-agent-data
+              mountPath: /run/spire/agent-data
             - name: spire-bundle
               mountPath: /run/spire/bundle
-            - name: spire-agent-socket
-              mountPath: /run/spire/sockets
-              readOnly: false
-            - name: spire-token
-              mountPath: /var/run/secrets/tokens
-            - name: procfs
-              mountPath: /host/proc
               readOnly: true
+            - name: spire-agent-socket
+              mountPath: /run/spire/agent-sockets
+            - name: spire-agent-token
+              mountPath: /var/run/secrets/tokens
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
           livenessProbe:
             httpGet:
               path: /live
-              port: 8080
-            failureThreshold: 2
-            initialDelaySeconds: 15
-            periodSeconds: 60
-            timeoutSeconds: 3
+              port: 9980
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
           readinessProbe:
             httpGet:
               path: /ready
-              port: 8080
+              port: 9980
             initialDelaySeconds: 5
             periodSeconds: 5
       volumes:
-        - name: spire-agent-data
-          emptyDir:
-            medium: Memory
         - name: spire-agent-config
           configMap:
-            name: spire-agent-configmap
-        - name: procfs
-          hostPath:
-            path: /proc
+            name: spire-agent
         - name: spire-bundle
           configMap:
             name: spire-bundle
+        - name: spire-agent-data
+          emptyDir:
+            medium: Memory
         - name: spire-agent-socket
           hostPath:
-            path: /run/spire/sockets
+            path: /run/spire/agent-sockets
             type: DirectoryOrCreate
-        - name: spire-token
+        - name: spire-agent-token
           projected:
             sources:
               - serviceAccountToken:
                   path: spire-agent
                   expirationSeconds: 7200
                   audience: spire-server
-
-
-
-

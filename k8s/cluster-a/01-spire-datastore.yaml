@@ -1,0 +1,115 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-db
+  namespace: spire-system
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spire-db
+  namespace: spire-system
+  labels:
+    app: spire-db
+spec:
+  replicas: 1
+  serviceName: spire-db
+  selector:
+    matchLabels:
+      app: spire-db
+  template:
+    metadata:
+      labels:
+        app: spire-db
+    spec:
+      serviceAccountName: spire-db
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          env:
+            - name: POSTGRES_DB
+              value: spire
+            - name: POSTGRES_USER
+              value: spire
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spire-db
+                  key: password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: spire-db-data
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 320Mi
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "spire", "-d", "spire"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "spire", "-d", "spire"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+  volumeClaimTemplates:
+    - metadata:
+        name: spire-db-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spire-db
+  namespace: spire-system
+spec:
+  selector:
+    app: spire-db
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: spire-db-allow-nested-server
+  namespace: spire-system
+spec:
+  podSelector:
+    matchLabels:
+      app: spire-db
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: spire-nested-server
+      ports:
+        - protocol: TCP
+          port: 5432

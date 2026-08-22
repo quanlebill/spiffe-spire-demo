@@ -1,0 +1,105 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rogue-agent
+  namespace: spire-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rogue-agent
+  namespace: spire-system
+data:
+  agent.conf: |
+    agent {
+      data_dir = "/run/spire/agent-data"
+      log_level = "INFO"
+      server_address = "spire-nested-server.spire-system.svc.cluster.local"
+      server_port = "8081"
+      socket_path = "/run/spire/agent-sockets/socket"
+      trust_bundle_path = "/run/spire/bundle/bundle.crt"
+      trust_domain = "ndip"
+    }
+
+    plugins {
+      NodeAttestor "k8s_psat" {
+        plugin_data {
+          cluster = "geic-a"
+        }
+      }
+
+      KeyManager "memory" {
+        plugin_data {}
+      }
+
+      WorkloadAttestor "unix" {
+        plugin_data {}
+      }
+    }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rogue-agent
+  namespace: spire-system
+  labels:
+    app: rogue-agent
+spec:
+  serviceAccountName: rogue-agent
+  restartPolicy: Never
+  securityContext:
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: spire-agent
+      image: ghcr.io/spiffe/spire-agent:1.15.2
+      args:
+        - -config
+        - /run/spire/config/agent.conf
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: rogue-agent-config
+          mountPath: /run/spire/config
+          readOnly: true
+        - name: agent-data
+          mountPath: /run/spire/agent-data
+        - name: agent-sockets
+          mountPath: /run/spire/agent-sockets
+        - name: spire-bundle
+          mountPath: /run/spire/bundle
+          readOnly: true
+        - name: spire-agent-token
+          mountPath: /var/run/secrets/tokens
+          readOnly: true
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+  volumes:
+    - name: rogue-agent-config
+      configMap:
+        name: rogue-agent
+    - name: spire-bundle
+      configMap:
+        name: spire-bundle
+    - name: agent-data
+      emptyDir: {}
+    - name: agent-sockets
+      emptyDir: {}
+    - name: spire-agent-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: spire-agent
+              expirationSeconds: 7200
+              audience: spire-server
